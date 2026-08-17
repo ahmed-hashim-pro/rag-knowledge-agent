@@ -141,36 +141,96 @@ rather than by the model.
 
 ### A cited answer, synthesised across documents
 
-> **Not yet captured.** This is the one example that requires a live API call,
-> and this README will not carry invented model output. Run the command below
-> against your own key to reproduce it.
-
-The offline window lives in the product spec, the field that exposes it lives in
-the API reference, and the FAQ explains the sequence — no single document
-answers this question. `--top-k 8` is needed because the default of 5 is spent
-on closer-but-vaguer chunks before the API reference is reached (measured in
-[`docs/design-notes.md`](docs/design-notes.md)); `--show-sources` prints exactly
-what was retrieved and at what score.
+The 12-minute window lives in the product spec, the field that exposes it lives
+in the API reference, and the FAQ explains what happens on reconnect — no single
+document answers this question. `--top-k 8` is needed because the default of 5
+is spent on closer-but-vaguer chunks before the API reference is reached
+(measured in [`docs/design-notes.md`](docs/design-notes.md)); `--show-sources`
+prints exactly what was retrieved and at what score.
 
 ```console
-$ export ANTHROPIC_API_KEY=sk-ant-...
 $ rag ask --top-k 8 --show-sources \
     "A Meridian-3 has stopped reporting. How long will it keep working, which telemetry field tells me how long it has been offline, and what does it do when that window expires?"
+Here are the answers to each part of your question:
+
+**How long it keeps working:**
+The Meridian-3 will continue executing its buffered task queue for up to **12 minutes** — this is the offline autonomy window, which is fixed in firmware and not configurable. [sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy]
+
+**Which telemetry field to watch:**
+The field to monitor is **`offline_seconds`**, which counts from the last successful report. You compare it against the 12-minute autonomy window; once it crosses that threshold, a safe-park has almost certainly occurred. [sample_corpus/api-reference.md:Fleet Control API Reference > Fleet Telemetry > GET /robots/{robot_id}/telemetry]
+
+**What happens when the window expires:**
+At the end of the window — or sooner if the buffered queue is exhausted — the robot performs a **safe-park**: it finishes its current motion segment, pulls out of travel lanes to the nearest designated safe-park zone, sets its **status beacon to amber**, and holds position until the link is restored. It will not accept new tasks and will not attempt to return to a dock (since dock assignment requires Fleet Control). [sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy]
+
+Once the link is restored, the robot resumes on its own — no manual intervention is required unless the beacon stays amber for more than a minute after reconnect. [sample_corpus/faq.md:Frequently Asked Questions > Fleet Operations > What happens during a network outage?]
+
+Sources:
+  - sample_corpus/faq.md:Frequently Asked Questions > Fleet Operations > What happens during a network outage?  (score 0.603)
+  - sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy  (score 0.532)
+  - sample_corpus/support-runbook.md:Support Runbook > Many Robots Offline at Once  (score 0.501)
+  - sample_corpus/support-runbook.md:Support Runbook > Single Robot Offline  (score 0.417)
+  - sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot  (score 0.407)
+  - sample_corpus/api-reference.md:Fleet Control API Reference > Fleet Telemetry > GET /robots/{robot_id}/telemetry  (score 0.406)
+  - sample_corpus/faq.md:Frequently Asked Questions > Hardware > Can I use our existing Meridian-2 docks?  (score 0.395)
+  - sample_corpus/api-reference.md:Fleet Control API Reference > Webhooks  (score 0.356)
+
+Confidence: high
+
+Retrieved context:
+  [1] [sample_corpus/faq.md:Frequently Asked Questions > Fleet Operations > What happens during a network outage?]  score=0.603
+      Meridian-3 robots keep working from their on-board task buffer for the duration of the offline autonomy window, then safe-park and wait. Nothing is lost: buffered tasks that completed while offline are reported to Fleet …
+  [2] [sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy]  score=0.532
+      Every Meridian-3 buffers its current task queue on board. If the robot loses its network link to Fleet Control it continues executing the buffered queue for up to **12 minutes**. This is the offline autonomy window. At t…
+  [3] [sample_corpus/support-runbook.md:Support Runbook > Many Robots Offline at Once]  score=0.501
+      **Trigger:** more than 20 % of a fleet reports `link_state = offline` within a two-minute span. **Diagnosis.** This is a network problem until proven otherwise. A genuine simultaneous hardware failure across many robots …
+  [4] [sample_corpus/support-runbook.md:Support Runbook > Single Robot Offline]  score=0.417
+      **Trigger:** one robot reports `link_state = offline` for more than two minutes. **Diagnosis.** Read its last telemetry. The two fields that matter are `position.zone` and `state_of_charge` at the last report. - If the z…
+  [5] [sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot]  score=0.407
+      The Meridian-3 is our third-generation floor AMR, shipping since March 2024. It replaces the Meridian-2 and is not mechanically compatible with Meridian-2 docking hardware.…
+  [6] [sample_corpus/api-reference.md:Fleet Control API Reference > Fleet Telemetry > GET /robots/{robot_id}/telemetry]  score=0.406
+      Returns the current state of one robot. This is the endpoint to poll when you need to know whether a robot is reachable. ```json { "robot_id": "mrd3-0041", "model": "meridian-3", "link_state": "offline", "offline_seconds…
+  [7] [sample_corpus/faq.md:Frequently Asked Questions > Hardware > Can I use our existing Meridian-2 docks?]  score=0.395
+      No. Meridian-3 is not mechanically compatible with Meridian-2 docking hardware. Dockyard-2 is the only supported station.…
+  [8] [sample_corpus/api-reference.md:Fleet Control API Reference > Webhooks]  score=0.356
+      Register endpoints in the console. Deliveries are signed with an HMAC-SHA256 signature in the `X-Acme-Signature` header; verify it before trusting the body. Acme retries a failed delivery 5 times with exponential backoff…
 ```
 
-Retrieval for that question is deterministic and *has* been verified — these are
-the eight chunks it selects, which is what the answer must be built from:
+Note what the citations demonstrate: the answer pulls the **12 minutes** from
+`product-specs.md`, the **`offline_seconds`** field name from
+`api-reference.md`, and the reconnect behaviour from `faq.md`, citing each at
+the point of use. The two `support-runbook.md` chunks and the Meridian-2 docking
+chunk were retrieved but not cited — they scored above the floor without
+containing anything the question asked for, which is exactly the case the
+`[source:heading]` discipline is there to make visible.
 
-| score | source | heading |
-| --- | --- | --- |
-| 0.603 | `faq.md` | Fleet Operations > What happens during a network outage? |
-| 0.532 | `product-specs.md` | Meridian-3 Autonomous Mobile Robot > Offline Autonomy |
-| 0.501 | `support-runbook.md` | Many Robots Offline at Once |
-| 0.417 | `support-runbook.md` | Single Robot Offline |
-| 0.407 | `product-specs.md` | Meridian-3 Autonomous Mobile Robot |
-| 0.406 | `api-reference.md` | Fleet Telemetry > GET /robots/{robot_id}/telemetry |
-| 0.395 | `faq.md` | Hardware > Can I use our existing Meridian-2 docks? |
-| 0.356 | `api-reference.md` | Webhooks |
+The same question in `--json` mode. Every `score` here comes from the retrieval
+layer, not the model — compare them against the `--show-sources` scores above:
+
+```console
+$ rag ask --top-k 8 --json \
+    "A Meridian-3 has stopped reporting. How long will it keep working, which telemetry field tells me how long it has been offline, and what does it do when that window expires?"
+{
+  "answer": "A Meridian-3 will keep working from its on-board task buffer for up to **12 minutes** — this is the offline autonomy window, fixed in firmware and not configurable [sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy].\n\nThe telemetry field to watch is **`offline_seconds`**, available from `GET /robots/{robot_id}/telemetry`. It counts from the last successful report, and crossing it against the 12-minute window is your signal that a safe-park has almost certainly occurred [sample_corpus/api-reference.md:Fleet Control API Reference > Fleet Telemetry > GET /robots/{robot_id}/telemetry].\n\nWhen the window expires — or when the buffered task queue is exhausted, whichever comes first — the robot performs a **safe-park**: it finishes its current motion segment, pulls out of travel lanes to the nearest designated safe-park zone, sets its status beacon to **amber**, and holds position until the link is restored. While parked it does not accept new tasks and does not attempt to return to a dock, because dock assignment requires Fleet Control [sample_corpus/product-specs.md:Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy].\n\nOnce the link returns, the robot resumes on its own. You will receive a `robot.link_restored` webhook followed by a `robot.safe_parked` event (and an amber `beacon`) if it did park. No manual intervention is required unless the beacon stays amber for more than a minute after reconnect [sample_corpus/faq.md:Frequently Asked Questions > Fleet Operations > What happens during a network outage?].",
+  "citations": [
+    {
+      "source": "sample_corpus/product-specs.md",
+      "heading": "Acme Robotics — Product Specifications > Meridian-3 Autonomous Mobile Robot > Offline Autonomy",
+      "score": 0.5323
+    },
+    {
+      "source": "sample_corpus/api-reference.md",
+      "heading": "Fleet Control API Reference > Fleet Telemetry > GET /robots/{robot_id}/telemetry",
+      "score": 0.406
+    },
+    {
+      "source": "sample_corpus/faq.md",
+      "heading": "Frequently Asked Questions > Fleet Operations > What happens during a network outage?",
+      "score": 0.6028
+    }
+  ],
+  "confidence": "high"
+}
+```
 
 ## Commands
 

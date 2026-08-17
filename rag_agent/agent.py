@@ -62,11 +62,18 @@ after the document block.
 
 # Cite every claim
 
-Follow each factual claim with a citation of the form [source:heading], copying \
-the `source` and `heading` attribute values of the document you used exactly as \
-written. When a single sentence draws on two documents, cite both. Never cite a \
-document that was not supplied in this turn, and never invent a source or a \
-heading.
+Follow each factual claim with a citation: the document's `source` attribute and \
+its `heading` attribute, joined by a colon, inside square brackets.
+
+For a document opening with source="guide.md" heading="Setup > Install", the \
+citation is exactly:
+
+[guide.md:Setup > Install]
+
+Copy both attribute values verbatim. Do not write the literal words "source" or \
+"heading" inside the brackets, and do not abbreviate a heading path. When a \
+single sentence draws on two documents, cite both. Never cite a document that \
+was not supplied in this turn, and never invent a source or a heading.
 
 # Refuse rather than guess
 
