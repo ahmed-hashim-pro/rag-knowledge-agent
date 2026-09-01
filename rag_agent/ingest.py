@@ -378,6 +378,12 @@ def ingest_path(
         results.append(result)
         if on_file is not None:
             on_file(result)
+
+    # Rebuilt unconditionally: the BM25 index is derived state, and a stale one
+    # would return hits for chunks the collection no longer holds.
+    if results:
+        store.build_lexical_index()
+
     return IngestSummary(results=tuple(results))
 
 

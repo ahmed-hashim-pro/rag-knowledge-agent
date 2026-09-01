@@ -33,6 +33,26 @@ DEFAULT_CHUNK_OVERLAP_TOKENS = 50
 #: Retrieval defaults.
 DEFAULT_TOP_K = 5
 
+#: How candidates are found: dense vectors, BM25 lexical matching, or both
+#: fused. See docs/design-notes.md for the measurements behind the default.
+RETRIEVAL_MODES = ("vector", "bm25", "hybrid")
+DEFAULT_RETRIEVAL_MODE = "hybrid"
+
+#: Reciprocal-rank-fusion constant. 60 is the value from the original RRF paper
+#: and is insensitive enough that tuning it is rarely worthwhile.
+DEFAULT_RRF_K = 60
+
+#: Candidate pool drawn from each retriever before fusion, as a multiple of
+#: top_k. Fusion can only promote a chunk that at least one retriever surfaced,
+#: so the pool must be wider than the final cut.
+DEFAULT_CANDIDATE_MULTIPLIER = 4
+DEFAULT_MIN_CANDIDATES = 20
+
+#: BM25 scores are unbounded and corpus-dependent, so they are squashed to
+#: [0, 1) as score / (score + SATURATION) before being compared against the same
+#: confidence floor the cosine scores use. Calibrated in docs/design-notes.md.
+DEFAULT_BM25_SATURATION = 8.0
+
 #: Cosine-similarity floor a chunk must clear to count as supporting evidence.
 #:
 #: Measured, not guessed. Against the bundled sample corpus (19 probe questions,
@@ -121,6 +141,9 @@ class RagConfig:
     chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS
     top_k: int = DEFAULT_TOP_K
     min_score: float = DEFAULT_MIN_SCORE
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE
+    rrf_k: int = DEFAULT_RRF_K
+    bm25_saturation: float = DEFAULT_BM25_SATURATION
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     history_turns: int = DEFAULT_HISTORY_TURNS
@@ -138,6 +161,15 @@ class RagConfig:
             raise ValueError(
                 f"min_score must be between 0.0 and 1.0, got {self.min_score}"
             )
+        if self.retrieval_mode not in RETRIEVAL_MODES:
+            raise ValueError(
+                f"retrieval_mode must be one of {', '.join(RETRIEVAL_MODES)}, "
+                f"got {self.retrieval_mode!r}"
+            )
+        if self.bm25_saturation <= 0:
+            raise ValueError(
+                f"bm25_saturation must be positive, got {self.bm25_saturation}"
+            )
 
     @classmethod
     def from_env(cls) -> RagConfig:
@@ -153,6 +185,9 @@ class RagConfig:
             ),
             top_k=_env_int("RAG_TOP_K", DEFAULT_TOP_K),
             min_score=_env_float("RAG_MIN_SCORE", DEFAULT_MIN_SCORE),
+            retrieval_mode=_env_str("RAG_RETRIEVAL", DEFAULT_RETRIEVAL_MODE),
+            rrf_k=_env_int("RAG_RRF_K", DEFAULT_RRF_K),
+            bm25_saturation=_env_float("RAG_BM25_SATURATION", DEFAULT_BM25_SATURATION),
             max_context_tokens=_env_int(
                 "RAG_MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS
             ),
@@ -190,3 +225,18 @@ def require_api_key() -> str:
             "Indexing (`rag ingest`) and `rag stats` do not need a key."
         )
     return key
+
+
+def candidate_pool_size(config: RagConfig) -> int:
+    """How many candidates each retriever contributes before fusion."""
+    return max(
+        config.top_k * DEFAULT_CANDIDATE_MULTIPLIER,
+        DEFAULT_MIN_CANDIDATES,
+    )
+
+
+def normalise_bm25(score: float, saturation: float) -> float:
+    """Squash an unbounded BM25 score into [0, 1) so one floor serves all modes."""
+    if score <= 0:
+        return 0.0
+    return score / (score + saturation)

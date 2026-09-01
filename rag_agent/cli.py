@@ -20,7 +20,7 @@ from rag_agent.agent import (
     RagAgent,
     Turn,
 )
-from rag_agent.config import MissingAPIKeyError, RagConfig
+from rag_agent.config import RETRIEVAL_MODES, MissingAPIKeyError, RagConfig
 from rag_agent.ingest import FileResult, ingest_path
 from rag_agent.retrieve import VectorStore
 
@@ -93,6 +93,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ask.add_argument("--model", default=None, help="Anthropic model id")
     p_ask.add_argument(
+        "--retrieval",
+        choices=RETRIEVAL_MODES,
+        default=None,
+        help="Retriever: vector (dense only), bm25 (lexical only), or hybrid "
+        "(RRF fusion of both). Default: hybrid, or $RAG_RETRIEVAL",
+    )
+    p_ask.add_argument(
         "--show-sources",
         action="store_true",
         help="Print the retrieved chunks and their scores (prose mode)",
@@ -104,6 +111,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--min-score", type=float, default=None, help="Cosine-similarity floor"
     )
     p_chat.add_argument("--model", default=None, help="Anthropic model id")
+    p_chat.add_argument(
+        "--retrieval", choices=RETRIEVAL_MODES, default=None, help="Retriever mode"
+    )
 
     sub.add_parser("stats", help="Show index size, indexed files, and settings")
 
@@ -119,6 +129,7 @@ def _config_from_args(args: argparse.Namespace) -> RagConfig:
         top_k=getattr(args, "top_k", None),
         min_score=getattr(args, "min_score", None),
         model=getattr(args, "model", None),
+        retrieval_mode=getattr(args, "retrieval", None),
     )
 
 
@@ -175,7 +186,12 @@ def _render_prose(result: AnswerResult, show_sources: bool) -> None:
         print("\nRetrieved context:")
         for i, chunk in enumerate(result.used, start=1):
             preview = " ".join(chunk.text.split())[:220]
-            print(f"  [{i}] {chunk.citation}  score={chunk.score:.3f}")
+            detail = [f"score={chunk.score:.3f}", f"via={chunk.matched_by}"]
+            if chunk.vector_score is not None:
+                detail.append(f"cos={chunk.vector_score:.3f}")
+            if chunk.lexical_score is not None:
+                detail.append(f"bm25={chunk.lexical_score:.2f}")
+            print(f"  [{i}] {chunk.citation}  " + "  ".join(detail))
             print(f"      {preview}…")
 
 
@@ -272,10 +288,16 @@ def _print_stats(store: VectorStore, config: RagConfig) -> None:
         f"{config.chunk_overlap_tokens} overlap"
     )
     print(
-        f"Retrieval       : top-{config.top_k}, "
+        f"Retrieval       : {config.retrieval_mode}, top-{config.top_k}, "
         f"min score {config.min_score:.2f}, "
         f"context budget {config.max_context_tokens} tokens"
     )
+    if store.count():
+        index = store.lexical_index()
+        print(
+            f"Lexical index   : BM25 over {index.size} chunks, "
+            f"{len(index.postings)} terms (k1={index.k1}, b={index.b})"
+        )
 
 
 def cmd_stats(args: argparse.Namespace, config: RagConfig) -> int:

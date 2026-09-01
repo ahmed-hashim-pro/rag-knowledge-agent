@@ -154,41 +154,148 @@ invites it to reuse a citation it can no longer verify. Keeping the context is
 coherent; the token budget is what stops it from being unbounded, dropping
 oldest-first.
 
+## Hybrid retrieval: BM25 alongside vectors
+
+Added in v1.1.0. `--retrieval` selects `vector` (dense only), `bm25` (lexical
+only), or `hybrid` (both, fused). Hybrid is the default.
+
+### Why fusion ranks, but gating does not
+
+Reciprocal rank fusion combines the two rankings by `Σ 1 / (k + rank)`. It works
+on *ranks* precisely because BM25 scores and cosine similarities have no common
+scale, and normalising one against the other needs corpus-specific constants.
+
+But that is also why RRF scores cannot gate. A fused score of 0.032 means
+nothing next to a 0.35 similarity floor, and quietly reusing the floor against
+fused scores would have invalidated the calibration that the entire refusal
+guarantee rests on. So the two concerns are kept apart:
+
+- **RRF decides the order.**
+- **The floor is applied to `score`**, the best normalised support any single
+  retriever gave that chunk — cosine as before, or BM25 squashed to `[0, 1)` by
+  `score / (score + 8)`.
+
+One floor, one confidence scheme, and `vector` mode behaves exactly as it did in
+v1.0.
+
+### Anchoring: the bug the measurements caught
+
+RRF rewards agreement. A chunk both retrievers found beats a chunk only one
+found — including that retriever's own **top** hit, because `1/(60+1)` from one
+list loses to `1/(60+6) + 1/(60+1)` from two.
+
+That is usually a feature. Here it was a regression. Unanchored fusion dropped
+the best semantic match for *"why would a robot slow down after we loaded it
+more heavily"* out of the top-5 entirely, taking the question's support from
+0.545 to **0.341** — below the floor, turning an answerable question into a
+refusal. Hybrid was returning *less* evidence than vector alone.
+
+The fix is to guarantee each retriever's top hit survives into the final
+selection, so hybrid is always a superset of what either mode would have
+surfaced on its own. A regression test asserts it, and `scripts/calibrate.py`
+checks the property across all twelve answerable probes.
+
+### What it actually bought
+
+Re-running the 19-probe calibration (`python scripts/calibrate.py`):
+
+| mode | on-topic min | off-topic max | separation | false accepts | false refusals |
+| --- | --- | --- | --- | --- | --- |
+| vector | 0.457 | 0.436 | +0.021 | 1 / 7 | 0 / 12 |
+| bm25 | 0.301 | 0.395 | −0.094 | 1 / 7 | 2 / 12 |
+| **hybrid** | **0.532** | **0.436** | **+0.096** | **1 / 7** | **0 / 12** |
+
+The separation between answerable and unanswerable questions widens roughly
+4.5×, from a 0.021 margin to 0.096, with no change to either error count. That
+margin is the whole safety budget of the confidence gate, and 0.021 was
+uncomfortably thin — one differently-worded question away from a false refusal.
+
+It also removes the `--top-k 8` workaround. The flagship example question needed
+eight candidates under pure vector search before the API-reference chunk naming
+`offline_seconds` appeared; under hybrid it is in the top **five**, because BM25
+ranks it first on the literal token while the vector retriever has it sixth.
+
+### The result that did not go as predicted
+
+v1.0's roadmap claimed hybrid search would fix exact-token queries — error
+codes, field names, identifiers — on the theory that dense retrieval cannot
+match a literal token. Measured, that theory does not hold on this corpus:
+
+| | right document in top-5 |
+| --- | --- |
+| vector | 10 / 10 |
+| bm25 | 10 / 10 |
+| hybrid | 10 / 10 |
+
+Dense retrieval already finds all ten. BM25 ranks them slightly better (`#1`
+where vector says `#2` for `offline_seconds` and `error code 409`), and that
+improved rank is what feeds the fusion win above — but the predicted *recall*
+failure never appears.
+
+The reason is corpus size. With 44 chunks there is little for an embedding to
+confuse; `all-MiniLM-L6-v2`'s wordpiece tokenizer also splits `offline_seconds`
+into recognisable parts, so even the "unmatchable" token is partly matchable.
+The failure mode is real, but it needs a corpus large enough that many chunks
+are topically indistinguishable and only the literal token separates them.
+
+So hybrid earns its default on the gate-margin result, not on the argument that
+motivated building it. Worth stating plainly: the roadmap's reasoning was wrong
+and the feature is worth shipping anyway, for a reason the measurement found.
+
+### What it costs
+
+Off-topic questions score higher under hybrid, because BM25 awards partial
+credit for shared ordinary words. *"How do I submit an expense report"* rises
+from 0.130 to 0.271 and *"what is the office dress code"* from 0.147 to 0.293 —
+still refused, but the comfortable ~0.22 margin becomes ~0.06. Nothing crosses
+the floor today; on a corpus with more incidental vocabulary overlap, something
+would. That is the trade the separation table is measuring, and the reason the
+calibration is a checked-in script rather than a one-off.
+
+Cost in resources is negligible: the BM25 index for this corpus is 25 KB of
+JSON over 775 terms, rebuilt on every ingest and fingerprinted so a stale index
+is detected and replaced rather than silently answering for deleted chunks.
+
 ## Top-k and cross-document questions
 
 The default `top_k` is 5, which suits single-topic questions. Compound questions
 that legitimately span documents can exhaust it before reaching a relevant one.
 
-A worked example from this corpus — *"A Meridian-3 has stopped reporting. How
-long will it keep working, which telemetry field tells me how long it has been
-offline, and what does it do when that window expires?"*:
+A worked example — *"A Meridian-3 has stopped reporting. How long will it keep
+working, which telemetry field tells me how long it has been offline, and what
+does it do when that window expires?"*:
 
-| top-k | documents retrieved |
-| --- | --- |
-| 5 | faq, product-specs, support-runbook |
-| 6+ | faq, product-specs, support-runbook, **api-reference** |
+| mode | top-k | documents retrieved |
+| --- | --- | --- |
+| vector | 5 | faq, product-specs, support-runbook |
+| vector | 8 | faq, product-specs, support-runbook, **api-reference** |
+| hybrid | 5 | faq, product-specs, support-runbook, **api-reference** |
 
-The API reference chunk that names `offline_seconds` scores 0.406 — comfortably
-above the floor, but sixth in line behind two FAQ and two runbook chunks that
-discuss the same subject in more general language. Raising `--top-k` fixes it at
-the cost of context tokens.
+The API-reference chunk that names `offline_seconds` scores 0.406 by cosine —
+above the floor, but sixth in line behind chunks that discuss the same subject
+in more general language. BM25 ranks it first, and fusion pulls it into the top
+five. This is the concrete case hybrid was kept for.
 
-This is the clearest argument for the two roadmap items below: a re-ranker would
-promote the chunk that actually answers the sub-question above the ones that
-merely share its topic, and hybrid search would match `offline_seconds` as a
-literal token rather than a semantic neighbour.
+A re-ranker would help here too, and for a different reason: it would promote
+the chunk that actually *answers* the sub-question over the ones that merely
+share its topic. That remains on the roadmap.
 
 ## What is deliberately missing
 
 - **No re-ranker.** Top-k plus a score floor, nothing else. A cross-encoder
   re-rank would improve precision on the hard negatives described above, and is
   the first thing to add.
-- **No hybrid search.** Pure dense retrieval misses exact-token queries — error
-  codes, field names, part numbers. BM25 alongside the vector search is the
-  natural fix and is on the roadmap.
 - **No pruning of deleted files.** A document removed from disk keeps its chunks
   in the index. Detecting deletions requires a full manifest reconciliation;
-  until then, `rm -rf chroma_db && rag ingest` is the honest workaround.
-- **No eval harness.** The calibration above is a one-off measurement in a
-  script, not a checked-in benchmark. Turning those 19 probes into a regression
-  suite is the difference between "tuned once" and "stays tuned".
+  until then, `rm -rf chroma_db && rag ingest` is the honest workaround. The
+  BM25 index does not share this weakness — it is rebuilt from the collection on
+  every ingest and fingerprinted — but it faithfully reproduces the stale chunks
+  the collection still holds.
+- **No stemming or query expansion.** BM25 matches `charging` and `charge` as
+  different terms. A Porter stemmer would help and costs no dependency; it is
+  omitted only because nothing in the probe set currently fails on it.
+- **Only a partial eval harness.** `scripts/calibrate.py` makes the retrieval
+  measurements reproducible, which is what turned the hybrid work from an
+  argument into a result. It is not yet a *regression* suite: nothing fails CI
+  when separation degrades, and it measures retrieval only — citation accuracy
+  and refusal correctness still rest on the unit tests.

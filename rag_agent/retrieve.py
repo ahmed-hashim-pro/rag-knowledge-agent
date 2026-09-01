@@ -20,11 +20,24 @@ import re
 import sys
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
-from rag_agent.config import RagConfig, estimate_tokens
+from rag_agent.config import (
+    RETRIEVAL_MODES,
+    RagConfig,
+    candidate_pool_size,
+    estimate_tokens,
+    normalise_bm25,
+)
 from rag_agent.ingest import Chunk
+from rag_agent.lexical import (
+    INDEX_FILENAME,
+    BM25Index,
+    corpus_fingerprint,
+    reciprocal_rank_fusion,
+)
 
 #: Any literal closing tag inside retrieved text is defanged before it reaches
 #: the model, so a document cannot terminate its own envelope.
@@ -78,18 +91,38 @@ def _quiet_model_load() -> Iterator[None]:
 
 @dataclass(frozen=True)
 class RetrievedChunk:
-    """One chunk returned from a similarity search, with its score."""
+    """One retrieved chunk and the evidence for keeping it.
+
+    ``score`` is what the confidence floor is applied to and what is shown to
+    the model: a [0, 1] support score, whatever mode produced the chunk. The
+    per-retriever fields below are diagnostics — either may be ``None`` when
+    only one retriever surfaced this chunk.
+    """
 
     text: str
     source: str
     heading: str
     chunk_index: int
     score: float
+    chunk_id: str = ""
+    vector_score: float | None = None
+    lexical_score: float | None = None
+    fused_score: float | None = None
 
     @property
     def citation(self) -> str:
         """The ``[source:heading]`` label the model is asked to cite with."""
         return f"[{self.source}:{self.heading}]" if self.heading else f"[{self.source}]"
+
+    @property
+    def matched_by(self) -> str:
+        """Which retrievers found this chunk — for ``--show-sources``."""
+        found = []
+        if self.vector_score is not None:
+            found.append("vector")
+        if self.lexical_score is not None:
+            found.append("bm25")
+        return "+".join(found) if found else "unknown"
 
 
 def _escape_document_text(text: str) -> str:
@@ -111,6 +144,7 @@ class VectorStore:
         self.config = config
         self._embedding_function = embedding_function
         self._collection: Any | None = None
+        self._lexical_index: BM25Index | None = None
 
     # -- construction ------------------------------------------------------
 
@@ -228,6 +262,7 @@ class VectorStore:
             n_results=min(top_k, self.count()),
             include=["documents", "metadatas", "distances"],
         )
+        ids = (payload.get("ids") or [[]])[0]
         documents = (payload.get("documents") or [[]])[0]
         metadatas = (payload.get("metadatas") or [[]])[0]
         distances = (payload.get("distances") or [[]])[0]
@@ -235,22 +270,209 @@ class VectorStore:
         results: list[RetrievedChunk] = []
         # Chroma returns strictly parallel arrays; strict=True makes that
         # invariant fail loudly rather than silently truncating results.
-        for text, metadata, distance in zip(
-            documents, metadatas, distances, strict=True
+        for chunk_id, text, metadata, distance in zip(
+            ids, documents, metadatas, distances, strict=True
         ):
-            metadata = metadata or {}
+            # Chroma reports cosine *distance*; invert it so higher is better.
+            similarity = round(1.0 - float(distance), 4)
             results.append(
-                RetrievedChunk(
-                    text=text,
-                    source=str(metadata.get("source", "unknown")),
-                    heading=str(metadata.get("heading", "")),
-                    chunk_index=int(metadata.get("chunk_index", 0)),
-                    # Chroma reports cosine *distance*; invert it so that a
-                    # higher score always means a better match.
-                    score=round(1.0 - float(distance), 4),
+                _chunk_from(
+                    chunk_id, text, metadata, score=similarity, vector=similarity
                 )
             )
         return results
+
+    def snapshot(self) -> tuple[list[str], list[str], list[str]]:
+        """Every chunk as ``(ids, documents, file_hashes)``, for index building."""
+        payload = self.collection.get(include=["documents", "metadatas"])
+        ids = list(payload.get("ids") or [])
+        documents = list(payload.get("documents") or [])
+        hashes = [
+            str((metadata or {}).get("file_hash", ""))
+            for metadata in payload.get("metadatas") or []
+        ]
+        return ids, documents, hashes
+
+    def fetch(self, chunk_ids: Sequence[str]) -> dict[str, RetrievedChunk]:
+        """Hydrate chunks by id, for lexical hits the vector search never saw."""
+        if not chunk_ids:
+            return {}
+        payload = self.collection.get(
+            ids=list(chunk_ids), include=["documents", "metadatas"]
+        )
+        found: dict[str, RetrievedChunk] = {}
+        for chunk_id, text, metadata in zip(
+            payload.get("ids") or [],
+            payload.get("documents") or [],
+            payload.get("metadatas") or [],
+            strict=True,
+        ):
+            found[chunk_id] = _chunk_from(chunk_id, text, metadata, score=0.0)
+        return found
+
+    # -- lexical index -----------------------------------------------------
+
+    @property
+    def lexical_index_path(self) -> Path:
+        return self.config.persist_dir / INDEX_FILENAME
+
+    def build_lexical_index(self) -> BM25Index:
+        """Rebuild the BM25 index from the collection and persist it."""
+        ids, documents, hashes = self.snapshot()
+        index = BM25Index.build(
+            ids=ids,
+            documents=documents,
+            fingerprint=corpus_fingerprint(ids, hashes),
+        )
+        index.save(self.lexical_index_path)
+        return index
+
+    def lexical_index(self, rebuild_if_stale: bool = True) -> BM25Index:
+        """Load the BM25 index, rebuilding it if it is missing or out of date.
+
+        The fingerprint check means an index left behind by an older ingest is
+        silently corrected rather than quietly returning results for documents
+        that no longer exist.
+        """
+        if self._lexical_index is not None:
+            return self._lexical_index
+
+        index = BM25Index.load(self.lexical_index_path)
+        if index is not None and rebuild_if_stale:
+            ids, _, hashes = self.snapshot()
+            if index.fingerprint != corpus_fingerprint(ids, hashes):
+                index = None
+        if index is None:
+            index = self.build_lexical_index()
+
+        self._lexical_index = index
+        return index
+
+
+def _chunk_from(
+    chunk_id: str,
+    text: str,
+    metadata: Any,
+    score: float,
+    vector: float | None = None,
+    lexical: float | None = None,
+    fused: float | None = None,
+) -> RetrievedChunk:
+    metadata = metadata or {}
+    return RetrievedChunk(
+        text=text,
+        source=str(metadata.get("source", "unknown")),
+        heading=str(metadata.get("heading", "")),
+        chunk_index=int(metadata.get("chunk_index", 0)),
+        score=score,
+        chunk_id=chunk_id,
+        vector_score=vector,
+        lexical_score=lexical,
+        fused_score=fused,
+    )
+
+
+def _vector_candidates(
+    store: VectorStore, question: str, pool: int
+) -> list[RetrievedChunk]:
+    return store.search(question, pool)
+
+
+def _lexical_candidates(
+    store: VectorStore, question: str, pool: int, saturation: float
+) -> list[RetrievedChunk]:
+    hits = store.lexical_index().search(question, pool)
+    if not hits:
+        return []
+    hydrated = store.fetch([chunk_id for chunk_id, _ in hits])
+    results: list[RetrievedChunk] = []
+    for chunk_id, raw in hits:
+        base = hydrated.get(chunk_id)
+        if base is None:
+            continue
+        results.append(
+            replace(
+                base,
+                score=round(normalise_bm25(raw, saturation), 4),
+                lexical_score=round(raw, 4),
+            )
+        )
+    return results
+
+
+def _fuse(
+    vector_hits: Sequence[RetrievedChunk],
+    lexical_hits: Sequence[RetrievedChunk],
+    rrf_k: int,
+    limit: int,
+) -> list[RetrievedChunk]:
+    """Merge two rankings with RRF, guaranteeing each retriever's best hit survives.
+
+    RRF decides the *order*; the confidence floor is applied to ``score``, the
+    best normalised support any single retriever gave the chunk. Fusion ranks
+    are not comparable to a similarity threshold, so using them for gating
+    would silently invalidate the calibrated floor.
+
+    The anchoring matters more than it looks. RRF rewards agreement, so a chunk
+    that only one retriever found is easily outscored by several that both
+    found — including that retriever's own top hit. Measured on the sample
+    corpus, unanchored fusion dropped the best semantic match for "why would a
+    robot slow down after we loaded it" out of the top-5 entirely, taking the
+    query's support score from 0.545 to 0.341 and turning an answerable question
+    into a refusal. Anchoring makes hybrid a superset of what either mode alone
+    would have surfaced.
+    """
+    fused_scores = reciprocal_rank_fusion(
+        [
+            [hit.chunk_id for hit in vector_hits],
+            [hit.chunk_id for hit in lexical_hits],
+        ],
+        k=rrf_k,
+    )
+
+    merged: dict[str, RetrievedChunk] = {}
+    for hit in (*vector_hits, *lexical_hits):
+        existing = merged.get(hit.chunk_id)
+        if existing is None:
+            merged[hit.chunk_id] = hit
+            continue
+        merged[hit.chunk_id] = replace(
+            existing,
+            vector_score=(
+                existing.vector_score
+                if existing.vector_score is not None
+                else hit.vector_score
+            ),
+            lexical_score=(
+                existing.lexical_score
+                if existing.lexical_score is not None
+                else hit.lexical_score
+            ),
+            score=max(existing.score, hit.score),
+        )
+
+    combined = [
+        replace(hit, fused_score=round(fused_scores.get(chunk_id, 0.0), 6))
+        for chunk_id, hit in merged.items()
+    ]
+    combined.sort(key=lambda hit: (-(hit.fused_score or 0.0), -hit.score))
+
+    anchors = [hits[0].chunk_id for hits in (vector_hits, lexical_hits) if hits]
+    selected = combined[:limit]
+    present = {hit.chunk_id for hit in selected}
+    for anchor in anchors:
+        if anchor in present:
+            continue
+        promoted = next(hit for hit in combined if hit.chunk_id == anchor)
+        for position in range(len(selected) - 1, -1, -1):
+            if selected[position].chunk_id not in anchors:
+                selected.pop(position)
+                break
+        selected.append(promoted)
+        present.add(anchor)
+
+    selected.sort(key=lambda hit: (-(hit.fused_score or 0.0), -hit.score))
+    return selected
 
 
 def retrieve(
@@ -259,14 +481,38 @@ def retrieve(
     config: RagConfig,
     top_k: int | None = None,
     min_score: float | None = None,
+    mode: str | None = None,
 ) -> list[RetrievedChunk]:
-    """Search, then apply the confidence floor.
+    """Retrieve candidates in the requested mode, then apply the confidence floor.
 
     An empty result is the signal for the caller to refuse rather than guess.
     """
     k = top_k if top_k is not None else config.top_k
     floor = min_score if min_score is not None else config.min_score
-    return [chunk for chunk in store.search(question, k) if chunk.score >= floor]
+    selected = mode if mode is not None else config.retrieval_mode
+    if selected not in RETRIEVAL_MODES:
+        raise ValueError(
+            f"unknown retrieval mode {selected!r}; "
+            f"expected one of {', '.join(RETRIEVAL_MODES)}"
+        )
+
+    if store.count() == 0:
+        return []
+
+    if selected == "vector":
+        ranked = _vector_candidates(store, question, k)
+    elif selected == "bm25":
+        ranked = _lexical_candidates(store, question, k, config.bm25_saturation)
+    else:
+        pool = candidate_pool_size(config)
+        ranked = _fuse(
+            _vector_candidates(store, question, pool),
+            _lexical_candidates(store, question, pool, config.bm25_saturation),
+            rrf_k=config.rrf_k,
+            limit=k,
+        )
+
+    return [chunk for chunk in ranked[:k] if chunk.score >= floor]
 
 
 def build_context(

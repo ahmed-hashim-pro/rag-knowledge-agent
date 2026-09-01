@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from rag_agent.config import RagConfig, estimate_tokens
+from rag_agent.config import RagConfig, estimate_tokens, normalise_bm25
 from rag_agent.ingest import ingest_path
+from rag_agent.lexical import BM25Index
 from rag_agent.retrieve import (
     RetrievedChunk,
     VectorStore,
@@ -228,3 +229,134 @@ def test_verbose_escape_hatch_passes_everything_through(capfd, monkeypatch) -> N
     with _quiet_model_load():
         _emit_on_fd2("Loading weights: 50%\n")
     assert "Loading weights" in capfd.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Retrieval modes and fusion
+# --------------------------------------------------------------------------
+
+
+def test_lexical_index_is_built_and_persisted_on_ingest(
+    corpus: Path, store, config: RagConfig
+) -> None:
+    ingest_path(corpus, store, config)
+    assert store.lexical_index_path.exists()
+    assert store.lexical_index().size == store.count()
+
+
+def test_stale_lexical_index_is_rebuilt(corpus: Path, store, config: RagConfig) -> None:
+    ingest_path(corpus, store, config)
+    index = BM25Index.load(store.lexical_index_path)
+    assert index is not None
+
+    index.fingerprint = "no-longer-matches"
+    index.save(store.lexical_index_path)
+    store._lexical_index = None
+
+    rebuilt = store.lexical_index()
+    assert rebuilt.fingerprint != "no-longer-matches"
+
+
+def test_bm25_mode_finds_an_exact_token(corpus: Path, store, config: RagConfig) -> None:
+    (corpus / "api.md").write_text(
+        "# API\n\n## Telemetry\n\nThe `offline_seconds` field counts from the "
+        "last report.\n",
+        encoding="utf-8",
+    )
+    ingest_path(corpus, store, config)
+
+    hits = retrieve(store, "offline_seconds", config, mode="bm25", min_score=0.0)
+    assert hits and hits[0].source.endswith("api.md")
+    assert hits[0].lexical_score is not None
+    assert hits[0].vector_score is None, "bm25 mode does not compute cosine"
+
+
+def test_unknown_mode_is_rejected(real_store: VectorStore, config) -> None:
+    with pytest.raises(ValueError, match="unknown retrieval mode"):
+        retrieve(real_store, "anything", config, mode="magic")
+
+
+def test_hybrid_reports_which_retrievers_matched(
+    real_store: VectorStore, config
+) -> None:
+    hits = retrieve(
+        real_store,
+        "what happens on a network outage",
+        config,
+        mode="hybrid",
+        min_score=0.0,
+    )
+    assert hits
+    assert all(hit.matched_by in ("vector", "bm25", "vector+bm25") for hit in hits)
+    assert any(hit.fused_score is not None for hit in hits)
+
+
+def test_hybrid_keeps_each_retrievers_best_hit(real_store: VectorStore, config) -> None:
+    """Anchoring: RRF must never discard the top hit of either retriever.
+
+    Without this, a chunk only one retriever found is outscored by chunks both
+    found, and hybrid can return *less* evidence than vector alone.
+    """
+    question = "why would a robot slow down after we loaded it more heavily"
+
+    vector_best = retrieve(
+        real_store, question, config, mode="vector", top_k=1, min_score=0.0
+    )
+    lexical_best = retrieve(
+        real_store, question, config, mode="bm25", top_k=1, min_score=0.0
+    )
+    hybrid = retrieve(real_store, question, config, mode="hybrid", min_score=0.0)
+
+    hybrid_ids = {hit.chunk_id for hit in hybrid}
+    assert vector_best[0].chunk_id in hybrid_ids
+    assert lexical_best[0].chunk_id in hybrid_ids
+
+
+def test_hybrid_never_returns_less_support_than_vector(
+    real_store: VectorStore, config
+) -> None:
+    for question in (
+        "what happens when the robot loses its network connection?",
+        "how fast does it recharge",
+        "offline task buffer duration",
+    ):
+        vector = retrieve(real_store, question, config, mode="vector", min_score=0.0)
+        hybrid = retrieve(real_store, question, config, mode="hybrid", min_score=0.0)
+        best_vector = max((hit.score for hit in vector), default=0.0)
+        best_hybrid = max((hit.score for hit in hybrid), default=0.0)
+        assert best_hybrid >= best_vector - 1e-9, question
+
+
+def test_hybrid_still_refuses_off_topic_questions(
+    real_store: VectorStore, config
+) -> None:
+    """Adding lexical recall must not weaken the confidence gate."""
+    gated = retrieve(
+        real_store,
+        "what is the company parental leave policy",
+        config,
+        mode="hybrid",
+        min_score=0.35,
+    )
+    assert gated == []
+
+
+def test_every_mode_respects_top_k(real_store: VectorStore, config) -> None:
+    for mode in ("vector", "bm25", "hybrid"):
+        hits = retrieve(real_store, "robot", config, mode=mode, top_k=2, min_score=0.0)
+        assert len(hits) <= 2, mode
+
+
+def test_modes_return_nothing_on_an_empty_index(store, config: RagConfig) -> None:
+    for mode in ("vector", "bm25", "hybrid"):
+        assert retrieve(store, "anything", config, mode=mode, min_score=0.0) == []
+
+
+def test_config_rejects_an_unknown_default_mode() -> None:
+    with pytest.raises(ValueError, match="retrieval_mode must be one of"):
+        RagConfig(retrieval_mode="telepathy")
+
+
+def test_bm25_normalisation_is_bounded_and_monotonic() -> None:
+    assert normalise_bm25(0.0, 8.0) == 0.0
+    assert 0.0 < normalise_bm25(1.0, 8.0) < normalise_bm25(50.0, 8.0) < 1.0

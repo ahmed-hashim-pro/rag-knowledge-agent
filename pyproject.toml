@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rag-knowledge-agent"
-version = "1.0.0"
+version = "1.1.0"
 description = "A CLI RAG agent that answers questions over a local corpus with citations, confidence gating, and prompt-injection defences."
 readme = "README.md"
 requires-python = ">=3.11"
