@@ -36,8 +36,9 @@ flowchart LR
 git clone https://github.com/ahmed-hashim-pro/rag-knowledge-agent.git
 cd rag-knowledge-agent
 
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e .                 # ~1.3 GB, a few minutes — see note below
 
 # Indexing is fully local — no key required.
 rag ingest sample_corpus
@@ -51,7 +52,16 @@ rag ask --json "What are the task dispatch rate limits?" | jq .
 rag chat
 ```
 
-First run downloads the ~90 MB embedding model. Python 3.11+.
+**Before you start the install**, so nothing looks like it has hung: it pulls
+about **1.3 GB** and takes a few minutes on a fast connection. Most of that is
+`torch` (529 MB), which `sentence-transformers` requires to run the embedding
+model locally — the trade for indexing that costs nothing and needs no API key.
+The first command that embeds anything also downloads the 87 MB
+`all-MiniLM-L6-v2` model from HuggingFace, so the first run needs network access
+even though every run after it is offline.
+
+Python 3.11+. Verified end to end on macOS (arm64, Python 3.12); the pinned
+dependencies also resolve cleanly on 3.13 and 3.14.
 
 ## Example session
 
