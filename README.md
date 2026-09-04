@@ -1,5 +1,7 @@
 # rag-knowledge-agent
 
+[![CI](https://github.com/ahmed-hashim-pro/rag-knowledge-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/ahmed-hashim-pro/rag-knowledge-agent/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A command-line RAG agent that answers questions about a folder of documents and
 shows its work. Documents are chunked along their markdown structure, embedded
 locally with `all-MiniLM-L6-v2`, and indexed twice — once as dense vectors in

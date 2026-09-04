@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The retrieval-relevance tests embed with the real all-MiniLM-L6-v2.
+      # Cache the 87 MB download so only the first run on a given cache key
+      # pays for it, and a HuggingFace outage cannot fail an unrelated PR.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-all-MiniLM-L6-v2-${{ runner.os }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      # No ANTHROPIC_API_KEY is set anywhere in this workflow. The suite passing
+      # here is the proof that the Anthropic client is stubbed throughout.
+      - name: Test
+        run: pytest -q
+
+      # The README's quickstart, executed verbatim. Indexing is fully local, so
+      # this must succeed with no key — if it ever needs one, this step fails.
+      - name: Quickstart indexing works with no API key
+        run: |
+          rag ingest sample_corpus
+          rag stats
