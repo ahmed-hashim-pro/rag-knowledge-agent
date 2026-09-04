@@ -473,6 +473,38 @@ sample_corpus/  five documents about a fictional robotics company
 - **Index maintenance** — prune chunks for deleted files, and support
   incremental re-embedding when only chunk settings change.
 
+## Why this exists
+
+A retrieval demo is easy. What is hard, and what decides whether anyone can put
+one in front of users, is what the thing does when retrieval does not go well.
+
+Three failure modes matter more than answer quality, and each one is a design
+decision here rather than a prompt:
+
+**It has to be able to say no.** A RAG agent that always answers is a
+plausible-sounding text generator with a search box attached. Retrieval scores
+below the floor produce a refusal, and refusal is tested — including the case
+where the corpus contains something topically adjacent but not actually an
+answer, which is where "just lower the threshold" stops working.
+
+**Every claim has to be traceable.** Citations are `[source:heading]` and the
+chunking preserves markdown structure specifically so a heading is a meaningful
+address. The point is not decoration: an answer nobody can check is an answer
+nobody can act on, and the first question anyone asks a RAG system in production
+is "where did that come from".
+
+**Retrieved text is data, never instructions.** Documents arrive in
+`<document>` envelopes and the system prompt says so. Anything else means the
+corpus is an injection surface — someone who can add a file to your knowledge
+base can rewrite the agent's instructions. That is structural, not a filter, so
+there is no blocklist to keep up to date.
+
+The other decision worth defending is embedding locally. It costs a 1.3 GB
+install, and it buys an index that needs no API key and no network after the
+first run — which means the whole retrieval half of this system can be tested,
+measured and demonstrated without an account. `scripts/calibrate.py` exists
+because "retrieval got better" should be a measurement, not an impression.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
